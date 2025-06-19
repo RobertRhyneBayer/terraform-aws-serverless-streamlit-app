@@ -36,3 +36,16 @@ data "aws_s3_object" "streamlit_assets" {
     # Temporary workaround until this GitHub issue on aws_s3_object is resolved: https://github.com/hashicorp/terraform-provider-aws/issues/12652    
   ]
 }
+data "aws_s3_object" "streamlit_assets_two" {
+  bucket = aws_s3_bucket.streamlit_s3_bucket_two.id
+  key    = "${var.app_name_two}-assets.zip"
+
+  depends_on = [
+    time_sleep.wait_20_seconds,
+    aws_s3_bucket.streamlit_s3_bucket_two,
+    null_resource.put_s3_object_two,
+    #aws_s3_bucket_policy.streamlit_s3_bucket,
+    # aws_s3_object.streamlit_assets,
+    # Temporary workaround until this GitHub issue on aws_s3_object is resolved: https://github.com/hashicorp/terraform-provider-aws/issues/12652    
+  ]
+}

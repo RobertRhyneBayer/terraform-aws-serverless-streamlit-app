@@ -7,6 +7,11 @@ resource "random_string" "streamlit_s3_bucket" {
   special = false
   upper   = false
 }
+resource "random_string" "streamlit_s3_bucket_two" {
+  length  = 4
+  special = false
+  upper   = false
+}
 
 ################################################################################
 # sleep
@@ -406,6 +411,28 @@ resource "aws_lb_target_group" "streamlit_tg" {
   )
 }
 
+resource "aws_lb_target_group" "streamlit_tg_two" {
+  name        = "${var.app_name_two}-tg"
+  port        = 80
+  protocol    = "HTTP"
+  target_type = "ip"
+  vpc_id      = var.create_vpc_resources ? aws_vpc.streamlit_vpc[0].id : var.existing_vpc_id
+  health_check {
+    path                = "/healthz"
+    interval            = 30
+    timeout             = 10
+    healthy_threshold   = 3
+    unhealthy_threshold = 3
+  }
+
+  tags = merge(
+    var.tags,
+    {
+      Name = "${var.app_name_two}-tg"
+    }
+  )
+}
+
 # Create Listener for ALB
 # HTTP Listener
 resource "aws_lb_listener" "http" {
@@ -443,9 +470,10 @@ resource "aws_lb_listener_certificate" "https" {
 
 
 # Create deny rule for ALB. This prevents users from accessing the ALB directly. Instead, they must go throught CloudFront.
+/*
 resource "aws_lb_listener_rule" "deny_rule" {
   listener_arn = aws_lb_listener.http[0].arn
-  priority     = 1
+  priority     = 10
 
   action {
     type             = "forward"
@@ -459,11 +487,43 @@ resource "aws_lb_listener_rule" "deny_rule" {
     }
   }
 }
+*/
+resource "aws_lb_listener_rule" "app" {
+  listener_arn = aws_lb_listener.http[0].arn
+  priority     = 1
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.streamlit_tg.arn
+  }
+
+  condition {
+    path_pattern {
+      values = ["/app/*"]
+    }
+  }
+}
+resource "aws_lb_listener_rule" "app_two" {
+  listener_arn = aws_lb_listener.http[0].arn
+  priority     = 2
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.streamlit_tg_two.arn
+  }
+
+  condition {
+    path_pattern {
+      values = ["/app_two/*"]
+    }
+  }
+}
 
 # Create redirect rule for ALB where users must instead use CloudFront.
+/*
 resource "aws_lb_listener_rule" "redirect_rule" {
   listener_arn = aws_lb_listener.http[0].arn
-  priority     = 5
+  priority     = 50
 
   action {
     type = "redirect"
@@ -483,6 +543,7 @@ resource "aws_lb_listener_rule" "redirect_rule" {
     }
   }
 }
+*/
 
 
 ################################################################################
@@ -520,6 +581,14 @@ resource "aws_cloudfront_distribution" "streamlit_distribution" {
     cache_policy_id            = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad" # Caching Disabled
     origin_request_policy_id   = "216adef6-5c7f-47e4-b989-5492eafa07d3" # AllViewer
     response_headers_policy_id = "60669652-455b-4ae9-85a4-c4c02393f86c" # SimpleCORS policy ID
+
+/*
+    lambda_function_association {
+      event_type   = "viewer-request"
+      lambda_arn   = aws_lambda_function.lambda_edge.qualified_arn
+      include_body = false
+    }
+    */
   }
 
   restrictions {
@@ -557,6 +626,29 @@ resource "null_resource" "streamlit_cloudfront_invalidation" {
   ]
 }
 
+resource "null_resource" "streamlit_cloudfront_invalidation_two" {
+  count = var.enable_auto_cloudfront_invalidation ? 1 : 0
+  # Will only trigger this resource to re-run if changes are made to the Dockerfile
+  triggers = {
+    src_hash = data.archive_file.streamlit_assets_two.output_sha
+  }
+
+  # Create invalidation when new version of app two is uploaded to S3
+  provisioner "local-exec" {
+    command = "aws cloudfront create-invalidation --distribution-id ${aws_cloudfront_distribution.streamlit_distribution.id} --paths '/*'"
+
+  }
+
+  # Only create invalidation when new version of app is uploaded to S3
+  depends_on = [
+    # aws_s3_object.streamlit_assets,
+    # Temporary workaround until this GitHub issue on aws_s3_object is resolved: https://github.com/hashicorp/terraform-provider-aws/issues/12652
+    # data.aws_s3_object.streamlit_assets.key,
+    null_resource.put_s3_object_two,
+    aws_cloudfront_distribution.streamlit_distribution
+  ]
+}
+
 
 ################################################################################
 # ECS
@@ -579,7 +671,7 @@ resource "aws_ecs_cluster_capacity_providers" "streamlit_ecs_cluster" {
   }
 }
 
-# Create ECS Service
+# Create ECS Services
 resource "aws_ecs_service" "streamlit_ecs_service" {
   name            = "${var.app_name}-ecs-service"
   cluster         = aws_ecs_cluster.streamlit_ecs_cluster.id
@@ -607,6 +699,33 @@ resource "aws_ecs_service" "streamlit_ecs_service" {
   depends_on = [aws_lb_listener.http]
 }
 
+resource "aws_ecs_service" "streamlit_ecs_service_two" {
+  name            = "${var.app_name_two}-ecs-service"
+  cluster         = aws_ecs_cluster.streamlit_ecs_cluster.id
+  task_definition = aws_ecs_task_definition.streamlit_ecs_task_definition_two.arn
+  desired_count   = var.desired_count # Number of tasks to run
+  launch_type     = "FARGATE"
+  
+  network_configuration {
+    subnets         = var.existing_ecs_subnets != null ? var.existing_ecs_subnets : [aws_subnet.private_subnet1[0].id, aws_subnet.private_subnet2[0].id]
+    security_groups = var.existing_ecs_security_groups != null ? var.existing_ecs_security_groups : [aws_security_group.streamlit_ecs_sg[0].id]
+  }
+  load_balancer {
+    target_group_arn = aws_lb_target_group.streamlit_tg_two.arn
+    container_name   = "${var.app_name_two}-container"
+    container_port   = var.container_port
+  }
+
+  tags = merge(
+    var.tags,
+    {
+      Name = "${var.app_name_two}-ecs-service"
+    }
+  )
+  # The Amazon ECS service requires an explicit dependency on the Application Load Balancer listener rule and the Application Load Balancer listener. This prevents the service from starting before the listener is ready.
+  depends_on = [aws_lb_listener.http]
+}
+
 # Create CloudWatch Log Group for ECS
 resource "aws_cloudwatch_log_group" "streamlit_ecs_service_log_group" {
   name              = "/ecs/${var.app_name}-ecs-log-group"
@@ -619,8 +738,19 @@ resource "aws_cloudwatch_log_group" "streamlit_ecs_service_log_group" {
     }
   )
 }
+resource "aws_cloudwatch_log_group" "streamlit_ecs_service_log_group_two" {
+  name              = "/ecs/${var.app_name_two}-ecs-log-group"
+  retention_in_days = 365
+  kms_key_id        = var.streamlit_ecs_service_log_group_kms_key
 
-# Create ECS Task
+  tags = merge(var.tags,
+    {
+      Name = "/ecs/${var.app_name_two}-ecs-log-group"
+    }
+  )
+}
+
+# Create ECS Tasks
 resource "aws_ecs_task_definition" "streamlit_ecs_task_definition" {
   family                   = "${var.app_name}-ecs-task"
   requires_compatibilities = ["FARGATE"]
@@ -671,6 +801,56 @@ resource "aws_ecs_task_definition" "streamlit_ecs_task_definition" {
 
 }
 
+resource "aws_ecs_task_definition" "streamlit_ecs_task_definition_two" {
+  family                   = "${var.app_name_two}-ecs-task"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = var.task_cpu    # CPU units for Fargate (must be number, not string)
+  memory                   = var.task_memory # Memory in MiB for Fargate (must be number, not string)
+  task_role_arn            = var.existing_ecs_role != null ? var.existing_ecs_role : aws_iam_role.ecs_default_role[0].arn
+  execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
+
+  # Important: all numbers must not be in strings, see this: https://github.com/hashicorp/terraform-provider-aws/issues/6380
+  container_definitions = jsonencode([
+    {
+      name      = "${var.app_name_two}-container",
+      image     = "${aws_ecr_repository.streamlit_ecr_repo_two.repository_url}:${var.ecs_task_desired_image_tag != null ? var.ecs_task_desired_image_tag : data.aws_s3_object.streamlit_assets_two.version_id}",
+      cpu       = var.task_cpu    # CPU units for Fargate (must be number, not string)
+      memory    = var.task_memory # Memory in MiB for Fargate (must be number, not string)
+      essential = true,
+      portMappings = [
+        {
+          containerPort = var.container_port,
+          hostPort      = var.container_port,
+          protocol      = "tcp"
+        }
+      ],
+
+      logConfiguration = {
+        logDriver = "awslogs",
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.streamlit_ecs_service_log_group_two.name,
+          "awslogs-region"        = var.aws_region != null ? var.aws_region : data.aws_region.current.name,
+          "awslogs-stream-prefix" = "ecs"
+        }
+      }
+    }
+  ])
+
+  runtime_platform {
+    operating_system_family = var.ecs_operating_system_family
+    cpu_architecture        = var.ecs_cpu_architecture
+  }
+
+  tags = {
+    Name        = "${var.app_name_two}-ecs-task"
+    Environment = var.environment
+  }
+
+  depends_on = [ data.aws_s3_object.streamlit_assets_two ]
+
+}
+
 
 ################################################################################
 # ECR
@@ -693,10 +873,34 @@ resource "aws_ecr_repository" "streamlit_ecr_repo" {
   }
 }
 
+resource "aws_ecr_repository" "streamlit_ecr_repo_two" {
+  name                 = "${var.app_name_two}-repo"
+  image_tag_mutability = var.streamlit_ecr_repo_image_tag_mutability
+  image_scanning_configuration {
+    scan_on_push = var.enable_streamlit_ecr_repo_scan_on_push
+  }
+  encryption_configuration {
+    encryption_type = var.streamlit_ecr_repo_encryption_type
+    kms_key         = var.streamlit_ecr_repo_kms_key
+  }
+  # allow for reppo to be deleted even if it contains images
+  force_delete = var.streamlit_ecr_repo_enable_force_delete
+  tags = {
+    Name = "${var.app_name_two}-repo"
+  }
+}
+
 # TODO - Consider adding support for ECR Lifecycle rules in future module verison
 resource "aws_ecr_lifecycle_policy" "streamlit_ecr_repo" {
   count      = var.create_streamlit_ecr_repo_lifecycle_policy ? 1 : 0
   repository = aws_ecr_repository.streamlit_ecr_repo.name
+  policy     = var.streamlit_ecr_repo_lifecycle_policy
+
+}
+
+resource "aws_ecr_lifecycle_policy" "streamlit_ecr_repo_two" {
+  count      = var.create_streamlit_ecr_repo_lifecycle_policy ? 1 : 0
+  repository = aws_ecr_repository.streamlit_ecr_repo_two.name
   policy     = var.streamlit_ecr_repo_lifecycle_policy
 
 }
@@ -717,6 +921,11 @@ data "archive_file" "streamlit_assets" {
   source_dir  = var.path_to_app_dir != null ? var.path_to_app_dir : "${path.root}/app/"
   output_path = "${var.app_name}-assets.zip"
 }
+data "archive_file" "streamlit_assets_two" {
+  type = "zip"
+  source_dir  = var.path_to_app_dir != null ? var.path_to_app_dir : "${path.root}/app_two/"
+  output_path = "${var.app_name_two}-assets.zip"
+}
 # Create S3 bucket to store Streamlit Assets
 resource "aws_s3_bucket" "streamlit_s3_bucket" {
   bucket        = "${var.app_name}-assets-${random_string.streamlit_s3_bucket.result}"
@@ -725,14 +934,31 @@ resource "aws_s3_bucket" "streamlit_s3_bucket" {
     Name = "${var.app_name}-assets-${random_string.streamlit_s3_bucket.result}"
   }
 }
+resource "aws_s3_bucket" "streamlit_s3_bucket_two" {
+  bucket        = "${var.app_name_two}-assets-${random_string.streamlit_s3_bucket_two.result}"
+  force_destroy = true
+  tags = {
+    Name = "${var.app_name_two}-assets-${random_string.streamlit_s3_bucket_two.result}"
+  }
+}
 # Enable S3 Notifcations to use EventBridge
 resource "aws_s3_bucket_notification" "streamlit_s3_bucket" {
   bucket      = aws_s3_bucket.streamlit_s3_bucket.id
   eventbridge = true
 }
+resource "aws_s3_bucket_notification" "streamlit_s3_bucket_two" {
+  bucket      = aws_s3_bucket.streamlit_s3_bucket_two.id
+  eventbridge = true
+}
 # Enable S3 Bucket Versioning
 resource "aws_s3_bucket_versioning" "streamlit_s3_bucket" {
   bucket = aws_s3_bucket.streamlit_s3_bucket.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+resource "aws_s3_bucket_versioning" "streamlit_s3_bucket_two" {
+  bucket = aws_s3_bucket.streamlit_s3_bucket_two.id
   versioning_configuration {
     status = "Enabled"
   }
@@ -774,10 +1000,49 @@ data "aws_iam_policy_document" "streamlit_s3_bucket" {
     ]
   }
 }
+data "aws_iam_policy_document" "streamlit_s3_bucket_two" {
+  statement {
+    principals {
+      type = "AWS"
+      identifiers = [
+        data.aws_caller_identity.current.account_id,
+      ]
+    }
+    effect = "Allow"
+    actions = [
+      "s3:PutObject",
+    ]
+    # Allows S3:PutObject but only if the file being uploaded is the Streamlit .zip file
+    resources = [
+      # aws_s3_bucket.streamlit_s3_bucket.id,
+      "${aws_s3_bucket.streamlit_s3_bucket_two.arn}/${var.app_name_two}-assets.zip",
+    ]
+  }
+  statement {
+    principals {
+      type = "AWS"
+      identifiers = [
+        data.aws_caller_identity.current.account_id,
+      ]
+    }
+    effect = "Deny"
+    actions = [
+      "s3:PutObject",
+    ]
+    # Allows S3:PutObject but only if the file being uploaded is the Streamlit Assets .zip file
+    not_resources = [
+      "${aws_s3_bucket.streamlit_s3_bucket_two.arn}/${var.app_name_two}-assets.zip",
+    ]
+  }
+}
 
 resource "aws_s3_bucket_policy" "streamlit_s3_bucket" {
   bucket = aws_s3_bucket.streamlit_s3_bucket.id
   policy = data.aws_iam_policy_document.streamlit_s3_bucket.json
+}
+resource "aws_s3_bucket_policy" "streamlit_s3_bucket_two" {
+  bucket = aws_s3_bucket.streamlit_s3_bucket_two.id
+  policy = data.aws_iam_policy_document.streamlit_s3_bucket_two.json
 }
 # Push .zip file to S3 bucket
 # resource "aws_s3_object" "streamlit_assets" {
@@ -814,6 +1079,28 @@ resource "null_resource" "put_s3_object" {
     aws_s3_bucket_versioning.streamlit_s3_bucket
   ]
 }
+resource "null_resource" "put_s3_object_two" {
+  # Will only trigger this resource to re-run if changes are made to the Dockerfile
+  triggers = {
+    src_hash = data.archive_file.streamlit_assets_two.output_sha
+  }
+
+  # Put .zip file for Streamlit App Assets in S3 Bucket
+  provisioner "local-exec" {
+    command = "aws s3 cp ${var.app_name_two}-assets.zip s3://${aws_s3_bucket.streamlit_s3_bucket_two.id}/${var.app_name_two}-assets.zip"
+
+  }
+
+  # Only attempt to put the file when the S3 Bucket (and related resources) are created
+  depends_on = [
+    aws_s3_bucket.streamlit_s3_bucket_two,
+    aws_s3_bucket_notification.streamlit_s3_bucket_two,
+    aws_s3_bucket_policy.streamlit_s3_bucket_two,
+    aws_s3_bucket_versioning.streamlit_s3_bucket_two
+  ]
+}
+
+
 
 # Create S3 bucket to store CodePipeline Artifacts
 resource "aws_s3_bucket" "streamlit_codepipeline_artifacts" {
@@ -821,6 +1108,13 @@ resource "aws_s3_bucket" "streamlit_codepipeline_artifacts" {
   force_destroy = true
   tags = {
     Name = "${var.app_name}-pipeline-artifacts-${random_string.streamlit_s3_bucket.result}"
+  }
+}
+resource "aws_s3_bucket" "streamlit_codepipeline_artifacts_two" {
+  bucket        = "${var.app_name_two}-pipeline-artifacts-${random_string.streamlit_s3_bucket_two.result}"
+  force_destroy = true
+  tags = {
+    Name = "${var.app_name_two}-pipeline-artifacts-${random_string.streamlit_s3_bucket_two.result}"
   }
 }
 
@@ -834,6 +1128,15 @@ resource "aws_cloudwatch_event_bus" "streamlit_event_bus" {
   tags = merge(
     {
       "Name" = "${var.app_name}-event_bus"
+    },
+    var.tags,
+  )
+}
+resource "aws_cloudwatch_event_bus" "streamlit_event_bus_two" {
+  name = "${var.app_name_two}-event_bus"
+  tags = merge(
+    {
+      "Name" = "${var.app_name_two}-event_bus"
     },
     var.tags,
   )
@@ -874,10 +1177,51 @@ resource "aws_cloudwatch_event_rule" "default_event_bus_to_streamlit_event_bus" 
     },
   )
 }
+resource "aws_cloudwatch_event_rule" "default_event_bus_to_streamlit_event_bus_two" {
+  name          = "${var.app_name_two}-default_event_bus_to_${var.app_name_two}-event_bus"
+  description   = "Send all defined events from default event bus to Streamlit event bus."
+  role_arn      = aws_iam_role.eventbridge_invoke_streamlit_event_bus.arn
+  force_destroy = var.eventbridge_rules_enable_force_destroy
+  event_pattern = jsonencode({
+    source = ["aws.s3"],
+    detail-type = [
+      "Object Access Tier Changed",
+      "Object ACL Updated",
+      "Object Created",
+      "Object Deleted",
+      "Object Restore Completed",
+      "Object Restore Expired",
+      "Object Restore Initiated",
+      "Object Storage Class Changed",
+      "Object Tags Added",
+      "Object Tags Deleted"
+    ],
+    detail = {
+      bucket = {
+        name = [
+          aws_s3_bucket.streamlit_s3_bucket_two.id,
+        ]
+      }
+    }
+  })
+
+  tags = merge(
+    var.tags,
+    {
+      "Name" = "${var.app_name_two}-default_event_bus_to_${var.app_name_two}-event_bus"
+    },
+  )
+}
 resource "aws_cloudwatch_event_target" "default_event_bus_to_streamlit_event_bus" {
   rule      = aws_cloudwatch_event_rule.default_event_bus_to_streamlit_event_bus.name
   target_id = aws_cloudwatch_event_bus.streamlit_event_bus.name
   arn       = aws_cloudwatch_event_bus.streamlit_event_bus.arn
+  role_arn  = aws_iam_role.eventbridge_invoke_streamlit_event_bus.arn
+}
+resource "aws_cloudwatch_event_target" "default_event_bus_to_streamlit_event_bus_two" {
+  rule      = aws_cloudwatch_event_rule.default_event_bus_to_streamlit_event_bus_two.name
+  target_id = aws_cloudwatch_event_bus.streamlit_event_bus_two.name
+  arn       = aws_cloudwatch_event_bus.streamlit_event_bus_two.arn
   role_arn  = aws_iam_role.eventbridge_invoke_streamlit_event_bus.arn
 }
 
@@ -909,6 +1253,33 @@ resource "aws_cloudwatch_event_rule" "invoke_streamlit_codepipeline" {
     },
   )
 }
+resource "aws_cloudwatch_event_rule" "invoke_streamlit_codepipeline_two" {
+  name           = "${var.app_name_two}-invoke-streamlit-codepipeline"
+  event_bus_name = aws_cloudwatch_event_bus.streamlit_event_bus_two.name
+  description    = "Invoke Streamlit CodePipeline when object is uploaded to Streamlit S3 Bucket."
+  role_arn       = aws_iam_role.eventbridge_invoke_streamlit_codepipeline.arn
+  force_destroy  = var.eventbridge_rules_enable_force_destroy
+  event_pattern = jsonencode({
+    source = ["aws.s3"],
+    detail-type = [
+      "Object Created",
+    ],
+    detail = {
+      bucket = {
+        name = [
+          aws_s3_bucket.streamlit_s3_bucket_two.id,
+        ]
+      }
+    }
+  })
+
+  tags = merge(
+    var.tags,
+    {
+      "Name" = "${var.app_name_two}-default_event_bus_to_${var.app_name_two}-event_bus"
+    },
+  )
+}
 
 resource "aws_cloudwatch_event_target" "streamlit_codepipeline" {
   rule           = aws_cloudwatch_event_rule.invoke_streamlit_codepipeline.name
@@ -916,6 +1287,13 @@ resource "aws_cloudwatch_event_target" "streamlit_codepipeline" {
   arn            = aws_codepipeline.streamlit_codepipeline.arn
   role_arn       = aws_iam_role.eventbridge_invoke_streamlit_codepipeline.arn
   event_bus_name = aws_cloudwatch_event_bus.streamlit_event_bus.name
+}
+resource "aws_cloudwatch_event_target" "streamlit_codepipeline_two" {
+  rule           = aws_cloudwatch_event_rule.invoke_streamlit_codepipeline_two.name
+  target_id      = aws_codepipeline.streamlit_codepipeline_two.name
+  arn            = aws_codepipeline.streamlit_codepipeline_two.arn
+  role_arn       = aws_iam_role.eventbridge_invoke_streamlit_codepipeline.arn
+  event_bus_name = aws_cloudwatch_event_bus.streamlit_event_bus_two.name
 }
 
 ################################################################################
@@ -967,6 +1345,62 @@ resource "aws_codepipeline" "streamlit_codepipeline" {
 
       configuration = {
         ProjectName = aws_codebuild_project.streamlit_codebuild_project.name
+      }
+    }
+  }
+
+  depends_on = [
+    # aws_s3_object.streamlit_assets,
+    aws_s3_bucket.streamlit_s3_bucket,
+    # Temporary workaround until this GitHub issue on aws_s3_object is resolved: https://github.com/hashicorp/terraform-provider-aws/issues/12652
+    null_resource.put_s3_object
+  ]
+}
+resource "aws_codepipeline" "streamlit_codepipeline_two" {
+  name          = "${var.app_name_two}-pipeline"
+  role_arn      = aws_iam_role.streamlit_codepipeline_service_role.arn
+  pipeline_type = "V2"
+
+  artifact_store {
+    location = aws_s3_bucket.streamlit_codepipeline_artifacts_two.id
+    type     = "S3"
+  }
+
+  stage {
+    name = "Source"
+
+    action {
+      name             = "PullFromS3"
+      category         = "Source"
+      owner            = "AWS"
+      provider         = "S3"
+      version          = "1"
+      output_artifacts = ["source_output_artifacts"]
+
+      configuration = {
+        S3Bucket = aws_s3_bucket.streamlit_s3_bucket_two.id
+        # S3ObjectKey          = aws_s3_object.streamlit_assets.key
+        # Temporary workaround until this GitHub issue on aws_s3_object is resolved: https://github.com/hashicorp/terraform-provider-aws/issues/12652
+        S3ObjectKey          = data.aws_s3_object.streamlit_assets_two.key
+        PollForSourceChanges = false
+      }
+    }
+  }
+
+  stage {
+    name = "Build"
+
+    action {
+      name             = "StreamlitCodeBuild"
+      category         = "Build"
+      owner            = "AWS"
+      provider         = "CodeBuild"
+      input_artifacts  = ["source_output_artifacts"]
+      output_artifacts = ["build_output_artifacts"]
+      version          = "1"
+
+      configuration = {
+        ProjectName = aws_codebuild_project.streamlit_codebuild_project_two.name
       }
     }
   }
@@ -1070,6 +1504,94 @@ resource "aws_codebuild_project" "streamlit_codebuild_project" {
   )
 
 }
+resource "aws_codebuild_project" "streamlit_codebuild_project_two" {
+  name          = "${var.app_name_two}-image-builder"
+  description   = "CodeBuild project that creates Docker image and pushes to ECR when file is uploaded to ${var.app_name_two}-assets-${random_string.streamlit_s3_bucket_two.result} S3 bucket."
+  build_timeout = "10"
+  # TODO - allow for users to supply existing IAM role to be used with CodeBuild
+  service_role = aws_iam_role.streamlit_codebuild_service_role.arn
+  # service_role  = var.codebuild_service_role_arn != null ? var.codebuild_service_role_arn : aws_iam_role.codebuild_service_role.arn
+
+  environment {
+    compute_type = var.codebuild_compute_type
+    image        = var.codebuild_image
+    type         = var.codebuild_image_type
+    environment_variable {
+      name  = "APP_NAME"
+      value = var.app_name_two
+    }
+    environment_variable {
+      name  = "IMAGE_TAG"
+      value = var.app_version
+    }
+    environment_variable {
+      name  = "IMAGE_REPO_NAME"
+      value = "${var.app_name_two}-repo"
+    }
+    environment_variable {
+      name  = "IMAGE_REPO_URL"
+      value = aws_ecr_repository.streamlit_ecr_repo_two.repository_url
+    }
+    environment_variable {
+      name  = "STREAMLIT_S3_BUCKET"
+      value = aws_s3_bucket.streamlit_s3_bucket_two.id
+    }
+    environment_variable {
+      name  = "STREAMLIT_S3_OBJECT"
+      value = "${var.app_name_two}-assets.zip"
+    }
+    environment_variable {
+      name  = "AWS_REGION"
+      value = data.aws_region.current.name
+    }
+
+  }
+
+  source {
+    type     = "S3"
+    location = "${aws_s3_bucket.streamlit_s3_bucket_two.id}/${var.app_name_two}-assets.zip"
+
+    buildspec = var.path_to_build_spec != null ? file(var.path_to_build_spec) : <<EOF
+      version: 0.2
+      phases:
+        pre_build:
+          commands:
+            # Fetch the S3 object version id of the latest version of the app and store as environment variable
+            - echo Fetching the S3 object version id of the latest version of $APP_NAME...
+            - export LATEST_VERSION_ID=${data.aws_s3_object.streamlit_assets_two.version_id}
+            - echo $LATEST_VERSION_ID
+            # Log into Amazon ECR
+            - echo Logging in to Amazon ECR...
+            - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $IMAGE_REPO_URL
+        build:
+          commands:
+            # Build docker image using latest, app version and s3 object version id as tags
+            - echo Build started on `date`
+            - echo Building the Docker image...
+            - docker build -t $IMAGE_REPO_URL:latest -t $IMAGE_REPO_URL:$IMAGE_TAG -t $IMAGE_REPO_URL:$LATEST_VERSION_ID .
+            - echo Build completed on `date`
+        post_build:
+          commands:
+            # Push image with all tags to Amazon ECR
+            - echo Pushing the Docker image...
+            - docker push $IMAGE_REPO_URL --all-tags
+            - echo New image successfully pushed to ECR!
+    EOF
+
+  }
+
+  artifacts {
+    type = "NO_ARTIFACTS"
+  }
+
+  tags = merge(
+    var.tags,
+    {
+      "Name" = "${var.app_name_two}-image-builder"
+    },
+  )
+
+}
 
 
 ################################################################################
@@ -1131,6 +1653,7 @@ data "aws_iam_policy_document" "eventbridge_invoke_streamlit_event_bus_policy" {
     ]
     resources = [
       aws_cloudwatch_event_bus.streamlit_event_bus.arn,
+      aws_cloudwatch_event_bus.streamlit_event_bus_two.arn,
     ]
   }
 }
@@ -1155,6 +1678,7 @@ data "aws_iam_policy_document" "eventbridge_invoke_streamlit_codepipeline_policy
     ]
     resources = [
       aws_codepipeline.streamlit_codepipeline.arn,
+      aws_codepipeline.streamlit_codepipeline_two.arn,
     ]
   }
 }
@@ -1186,8 +1710,12 @@ data "aws_iam_policy_document" "streamlit_codepipeline_policy" {
     resources = [
       aws_s3_bucket.streamlit_s3_bucket.arn,
       "${aws_s3_bucket.streamlit_s3_bucket.arn}/*",
+      aws_s3_bucket.streamlit_s3_bucket_two.arn,
+      "${aws_s3_bucket.streamlit_s3_bucket_two.arn}/*",
       aws_s3_bucket.streamlit_codepipeline_artifacts.arn,
       "${aws_s3_bucket.streamlit_codepipeline_artifacts.arn}/*",
+      aws_s3_bucket.streamlit_codepipeline_artifacts_two.arn,
+      "${aws_s3_bucket.streamlit_codepipeline_artifacts_two.arn}/*",
     ]
   }
   # CodeBuild Allow
@@ -1208,7 +1736,7 @@ data "aws_iam_policy_document" "streamlit_codepipeline_policy" {
       "codebuild:List*",
     ]
     # resources = ["*"]
-    resources = [aws_codebuild_project.streamlit_codebuild_project.arn]
+    resources = [aws_codebuild_project.streamlit_codebuild_project_two.arn]
   }
 
 }
@@ -1237,8 +1765,12 @@ data "aws_iam_policy_document" "streamlit_codebuild_policy" {
     resources = [
       aws_s3_bucket.streamlit_s3_bucket.arn,
       "${aws_s3_bucket.streamlit_s3_bucket.arn}/*",
+      aws_s3_bucket.streamlit_s3_bucket_two.arn,
+      "${aws_s3_bucket.streamlit_s3_bucket_two.arn}/*",
       aws_s3_bucket.streamlit_codepipeline_artifacts.arn,
       "${aws_s3_bucket.streamlit_codepipeline_artifacts.arn}/*",
+      aws_s3_bucket.streamlit_codepipeline_artifacts_two.arn,
+      "${aws_s3_bucket.streamlit_codepipeline_artifacts_two.arn}/*",
     ]
   }
   # ECR Allow
@@ -1255,7 +1787,7 @@ data "aws_iam_policy_document" "streamlit_codebuild_policy" {
       "ecr:BatchGetImage",
     ]
     resources = [
-      aws_ecr_repository.streamlit_ecr_repo.arn,
+      aws_ecr_repository.streamlit_ecr_repo_two.arn,
       "*"
     ]
   }
@@ -1268,7 +1800,8 @@ data "aws_iam_policy_document" "streamlit_codebuild_policy" {
     ]
     resources = [
       "*",
-      "arn:aws:logs:${data.aws_region.current.name}${data.aws_caller_identity.current.account_id}:log-group:/aws/codebuild/${var.app_name}-image-builder:log-stream:*"
+      "arn:aws:logs:${data.aws_region.current.name}${data.aws_caller_identity.current.account_id}:log-group:/aws/codebuild/${var.app_name}-image-builder:log-stream:*",
+      "arn:aws:logs:${data.aws_region.current.name}${data.aws_caller_identity.current.account_id}:log-group:/aws/codebuild/${var.app_name_two}-image-builder:log-stream:*"
     ]
   }
 }
@@ -1290,7 +1823,8 @@ data "aws_iam_policy_document" "ecs_default_policy" {
       "ecr:BatchGetImage",
     ]
     resources = [
-      aws_ecr_repository.streamlit_ecr_repo.arn
+      aws_ecr_repository.streamlit_ecr_repo.arn,
+      aws_ecr_repository.streamlit_ecr_repo_two.arn
     ]
   }
   # CloudWatch Allow
@@ -1301,7 +1835,8 @@ data "aws_iam_policy_document" "ecs_default_policy" {
       "logs:PutLogEvents"
     ]
     resources = [
-      aws_cloudwatch_log_group.streamlit_ecs_service_log_group.arn
+      aws_cloudwatch_log_group.streamlit_ecs_service_log_group.arn,
+      aws_cloudwatch_log_group.streamlit_ecs_service_log_group_two.arn
     ]
   }
 }

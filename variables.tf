@@ -9,6 +9,11 @@ variable "app_name" {
   type        = string
   default     = "streamlit"
 }
+variable "app_name_two" {
+  description = "The name of your application. This value is appended at the beginning of resource names."
+  type        = string
+  default     = "streamlit-two"
+}
 variable "app_version" {
   description = "The version of the application. This is set to be used as the tag for the Docker image. Defaults to latest. Update this variable when making changes to your application to ensure you don't overwrite your previous image. Overwriting your previous image will prevent you from being able to roll back if you need."
   type        = string

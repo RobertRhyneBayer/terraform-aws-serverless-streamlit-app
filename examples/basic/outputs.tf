@@ -1,3 +1,4 @@
+
 output "streamlit_ecr_repo_image_uri" {
   value = module.serverless-streamlit-app.streamlit_ecr_repo_image_uri
 }

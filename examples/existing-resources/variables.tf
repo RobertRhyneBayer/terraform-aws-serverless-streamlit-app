@@ -2,6 +2,10 @@ variable "app_name" {
   type    = string
   default = "sample-existing"
 }
+variable "app_name_two" {
+  type    = string
+  default = "sample-existing-two"
+}
 
 variable "container_port" {
   description = "The port number for the ECS container. Default is 8501 (Streamlit default port)."
